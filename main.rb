@@ -2,13 +2,12 @@ require 'rubygems'
 require 'sinatra'
 
 class Stream
-   attr_accessor :local, :remote, :packets, :responsePairs
+   attr_accessor :client, :server, :packets, :transactions
 
-   def initialize(local, remote, packets, responsePairs)
-      @local = local
-      @remote = remote
-      @packets = packets
-      @responsePairs = responsePairs
+   def initialize(client, server, transactions)
+      @client = client
+      @server = server
+      @transactions = transactions
    end
 end
 
@@ -21,13 +20,12 @@ class Packet
    end
 end
 
-class ResponsePair
-   attr_accessor :request, :fullRequest, :response
+class Transaction
+   attr_accessor :clientRequest, :serverResponse
 
-   def initialize(request, fullRequest, response)
-      @request = request
-      @fullRequest = fullRequest
-      @response = response
+   def initialize(clientRequest, serverResponse)
+      @clientRequest = clientRequest
+      @serverResponse = serverResponse
    end
 end
 
@@ -41,10 +39,13 @@ class MyMiddleware
 
       if status == 999
          puts "crayzay"
-         response = Rack::Response.new
-         response.write Streams["3"].responsePairs[0].response
-         response.finish
+         
+         serverResponse = Rack::serverResponse.new
+         serverResponse.body = Streams["3"].transactions[0].serverResponse
+         serverResponse.finish
       else
+         puts "normal #{status}"
+         
          [status,headers,body]
       end
    end
@@ -79,19 +80,19 @@ parsedPackets.each do |parsedPacket|
 
    if Streams.has_key?(streamID)
       direction = ">"
-      if source == Streams[streamID].remote
+      if source == Streams[streamID].server
          direction = "<"
       end
 
       if Streams[streamID].packets.size == 0 || (direction == ">" && Streams[streamID].packets.last.direction == "<")
          match = packetData.match(/\AGET ([^\r\n]+) HTTP.+\r?\nHost: ([^\r\n]+)/m)
-         Streams[streamID].responsePairs.push(ResponsePair.new(match[2].concat(match[1]),"",""))
+         Streams[streamID].transactions.push(transaction.new(match[2].concat(match[1]),"",""))
       end
 
       if direction == ">"
-         Streams[streamID].responsePairs.last.fullRequest.concat(packetData)
+         Streams[streamID].transactions.last.fullclientRequest.concat(packetData)
       else
-         Streams[streamID].responsePairs.last.response.concat(packetData)
+         Streams[streamID].transactions.last.serverResponse.concat(packetData)
       end
 
       Streams[streamID].packets.push(Packet.new(packetData, direction))
@@ -100,11 +101,11 @@ parsedPackets.each do |parsedPacket|
 end # parse packets into Streams
 
 
-# parse Streams into response pairs
-responses = Array.new
+# parse Streams into serverResponse pairs
+serverResponses = Array.new
 Streams.each_value do |stream|
    
-end # parse Streams into response pairs
+end # parse Streams into serverResponse pairs
 
 use MyMiddleware
 
@@ -112,16 +113,20 @@ get "/" do
    # print Streams
    outputStr = String.new
    Streams.each_pair do |streamID, stream|      
-      outputStr << "############ (#{streamID}) #{stream.local} -> #{stream.remote} #############\n(#{stream.packets.size} packets, #{stream.responsePairs.size} response pairs)\n"
+      outputStr << "############ (#{streamID}) #{stream.client} -> #{stream.server} #############\n(#{stream.packets.size} packets, #{stream.transactions.size} serverResponse pairs)\n"
       outputStr << "<ul>\n"
       counter = 0
-      stream.responsePairs.each do |responsePair|
-         #outputStr << "Pair %d:\n   REQUEST{\n%s\n   }REQUEST\n   RESPONSE{\n%s\n   }RESPONSE\n" % [counter, responsePair.request, responsePair.response]
-         outputStr << "<li><a href=\"#{responsePair.request}\" title=\"#{responsePair.fullRequest}\">#{responsePair.request}</a></li>\n"
+      stream.packets.each do |packet|
+        outputStr << "<li><code>#{packet.data.encode({:xml => :text})}</code></li>"
+        counter += 1
+      end
+=begin
+      stream.transactions.each do |transaction|
+         outputStr << "<li><a href=\"#{transaction.clientRequest}\" title=\"#{transaction.fullclientRequest}\">#{transaction.clientRequest}</a></li>\n"
          counter += 1
       end
+=end
       outputStr << "</ul>\n"
-
       outputStr << "\n\n"
    end # print Streams
 
@@ -129,6 +134,6 @@ get "/" do
    "<html><header><title>Hi</title></header><body>Hello World! You are a good world.\n\n#{outputStr}</body></html>"
 end
 
-get %r{/(.+)} do
+get %r{/bubba} do
    status 999
 end
