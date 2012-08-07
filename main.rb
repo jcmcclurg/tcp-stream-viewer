@@ -3,63 +3,24 @@ require 'sinatra'
 require 'thin'
 
 class Transaction
-   attr_reader :clientRequest, :clientRequestURI, :serverResponse, :serverResponseHeaders, :serverResponseBody, :serverResponseStatus
-   
-   def initialize()
-     @serverResponse = "";
-     @clientRequest  = ""; 
-   end
-   
-   def serverResponse=(response)
-      @serverResponse = response
-      
-      @serverResponseHeaders = getResponseHeaders(response)
-      @serverResponseStatus = getResponseStatus(response)
-      @serverResponseBody = getResponseBody(response)
-      
-   end
-   
-   def clientRequest=(request)
-      @clientRequest = request
-      @clientRequestURI = getRequestURI(request)
-   end
+   attr_accessor :request, :response
+end
 
-   private
-
-   def getRequestURI(request)
-      match = request.match(/\AGET ([^\n\r ]+) .+Host: ([^\n\r]+)/m)
-      
-      if !match.nil?
-         match[2].concat(match[1])
-      end
-   end
-
-   def getResponseStatus(response)
-      match = response.match(/\AHTTP[^\r\n ] ([0-9]+ [^\r\n]+)/m)
-      
-      if !match.nil?
-         match[1]
-      end
-   end
+class Response
+   attr_reader :status
+   attr_accessor :headers, :body
    
-   def getResponseHeaders(response)
-      header = Hash.new
-      lines = response.split(/\r\n/)
-      lines.shift
-      lines.each do |line|
-         if !line.nil? && line != ""
-            match = line.match(/^([^ ]+): (.+)$/)
-            header[match[1]] = match[2]
-         else
-            break
-         end
-      end
-      
-      header
+   def initialize(status)
+      @status = status
    end
+end
+
+class Request
+   attr_reader :path
+   attr_accessor :headers, :body
    
-   def getResponseBody(response)
-      response.sub(/\A.+?(\r?\n){2}/m,"")
+   def initialize(path)
+      @path = path
    end
 end
 
@@ -70,60 +31,134 @@ parsedPackets = `tshark -r #{dumpFile} -R "tcp.stream && data" -T fields -e tcp.
 parsedPackets = parsedPackets.split("\n")
 
 # We now have an array of individual packets. Let's separate these packets out
-# into arrays of individual $streams. The format of this array will be:
-# "clientIP:port serverIP:port" => array of Transaction objects
-$streams = Hash.new # The stream array
-$streamInfo = Array.new # An array of information about the $streams
-transactionMode = Hash.new # A temporary variable to keep track of the
-# current stream directions
+# into arrays of individual streams. The stream arrays will contain elements
+# which alternate in direction.
+streamData = Hash.new
+streamDirs = Hash.new
 
 parsedPackets.each do |parsedPacket|
    parsedPacket = parsedPacket.split("\t")
 
    streamID = parsedPacket[0]
-
-   # Wireshark displays the packet payload as an ASCII hexadecimal digit. We're
-   # going to change this back into a UTF-8 string
-   packetBytes = Array.new
-   packetData = parsedPacket[5].scan(/.{2}/)
-   packetData.each do |chr|
-      packetBytes.push(chr.hex)
-   end
-   packetData = packetBytes.pack("U*")
-
-   # Switch stream directions on GET requests and HTTP responses
-   if !packetData.match(/\AGET [^\r\n ]+/).nil?
-      if transactionMode[streamID] == "clientRequest"
-         abort("Got confused by two GET requests in a row:\n\n#{$streams[streamID].last.clientRequest}\n###########\n#{packetData}")
-      end
-
-      transactionMode[streamID] = "clientRequest"
+   fromAddr = "#{parsedPacket[1]}:#{parsedPacket[2]}"
+   toAddr = "#{parsedPacket[3]}:#{parsedPacket[4]}"
+   
+   if !streamData.has_key?(streamID)
+      streamData[streamID] = [parsedPacket[5]]
+      streamDirs[streamID] = [fromAddr,toAddr] 
+   
+   # Direction switches, so make a new element
+   elsif streamDirs[streamID][0] != fromAddr
+      streamData[streamID].push(parsedPacket[5])
+      streamDirs[streamID] = [fromAddr,toAddr]
       
-      if !$streams.has_key?(streamID)
-         $streams[streamID] = Array.new
-         $streamInfo.push({"client"=>"#{parsedPacket[1]}:#{parsedPacket[2]}","server"=>"#{parsedPacket[3]}:#{parsedPacket[4]}","streamID"=>streamID})
-      end
-      $streams[streamID].push(Transaction.new)
-      
-#      puts "Starting new clientRequest on #{streamID}"
-   elsif transactionMode[streamID] == "clientRequest" && !packetData.match(/\AHTTP/).nil?
-      transactionMode[streamID] = "serverResponse"
-#      puts "Switching to serverResponse mode on #{streamID}"
-   end # Switch stream directions
-
-   if $streams.has_key?(streamID)
-      if transactionMode[streamID] == "clientRequest"
-        $streams[streamID].last.clientRequest += packetData
-#        puts "Writing to clientRequest on #{streamID}"
-      else
-        $streams[streamID].last.serverResponse += packetData
-#        puts "Writing to serverResponse on #{streamID}"
-      end
+   # Direction remains the same, so append to the previous element
    else
-#     puts "Ignoring packet from #{streamID} because it does not begin with a GET request."
+      streamData[streamID].last += parsedPacket[5]
+   end
+end# Parse packets into streams
+
+streams = Hash.new
+streamData.each_pair do |streamID, stream|
+   
+   # Wireshark displays the packet payload as an ASCII hexadecimal digit. We need
+   # to parse the header to determine who is the client and who is the server
+   counter = 0
+   stream.each do |data|
+      
+      # Mode is as follows: 0 = first line
+      #                     1 = header
+      #                     2 = body
+      mode = 1
+      bodyBytes = Array.new
+      lineBytes = Array.new
+      bytesStr = data.scan(/.{2}/)
+      
+      bytesStr.each do |byteStr|
+         byte = byteStr.hex
+         
+         if mode < 2
+            lineBytes.push(byte)
+            
+            # CR+LF
+            if lineBytes.size >= 2 && lineBytes[lineBytes.size - 2] == 0x0D && lineBytes[lineBytes.size - 1] == 0x0A
+               currentLine = lineBytes.pack("C*")
+               
+               # If we are looking for the first line
+               if mode == 0
+                  matches = currentLine.match(/^GET ([^\n\r ]+)/)
+                  
+                  # Is the first line a request?
+                  if !matches.nil?
+                     path = matches[1]
+                     
+                     # Determine which is the server and which is the client based on our current position in the array and the size of the array
+                     # This can be done because the to and from positions switch with each element of the array
+                     fromAddr = streamDirs[streamID][(stream.size - count) % 2]
+                     toAddr = streamDirs[streamID][~((stream.size - count) % 2) & 0x1]
+                     streamDirs[streamID] = [toAddr, fromAddr]
+                     
+                     if !streams.has_key?(streamID)
+                        streams[streamID] = Array.new
+                     end
+                     
+                     streams[streamID].push(Transaction.new)
+                     streams[streamID].last.request = Request.new(path)
+                     
+                  # Is the first line a response to a previous request?
+                  elsif streams.has_key?(streamID)
+                     matches = currentLine.match(/^HTTP ([^\n\r ]+)/)
+                     
+                     if !matches.nil?
+                     status = matches[1]
+                     streams[streamID].last.response = Response.new(status)
+                     
+                     # Ignore responses for which we have no corresponding request.
+                     else
+                        puts "Ignoring packet from #{streamDirs[streamID]} because first line is [#{currentLine.chomp}]"
+                        break
+                     end
+                     
+                  end
+                  
+                  # We have found the first line. Time to move on to the header
+                  mode = 1
+               
+               # If we are looking for the headers (mode == 1)
+               else
+                  # If we encounter a blank line, we have finished with the headers. Time to move on to the body
+                  if lineBytes.size == 2
+                     mode = 2
+                  else
+                     matches = currentLine.match(/^([^: ]): ([^\r\n]+)/)
+                     
+                     # Differentiate between requests and responses
+                     if !streams[streamID].last.response.nil?
+                        streams[streamID].last.response.headers[matches[1]] = matches[2]
+                     else
+                        streams[streamID].last.request.headers[matches[1]] = matches[2]
+                     end
+                  end
+               end
+               
+               lineBytes = Array.new
+            end
+         
+         # (mode == 2)
+         else
+            # Differentiate between requests and responses
+            if !streams.last.response.nil?
+               streams.last.response.bodyBytes.push(byte)
+            else
+               streams.last.request.bodyBytes.push(byte)
+            end
+         end
+      end
+      
+      counter += 1
    end
    
-end# Parse packets into $streams
+end
 
 # This Middleware application serves up the requested captured HTTP response.
 class MyMiddleware
@@ -136,18 +171,12 @@ class MyMiddleware
       
       if env["QUERY_STRING"] == "bubba"
          puts "crayzay web response "
-         
-         status = $streams["3"][0].serverResponseStatus
-         headers = $streams["3"][0].serverResponseHeaders
-         body = $streams["3"][0].serverResponseBody
-         
-         puts headers
-         
-         [status, headers, body]
+         #[status, headers, body]
       else
          puts "normal web response"
-         @app.call(env)
-      end      
+      end
+      
+      @app.call(env)
    end
 end
 
